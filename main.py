@@ -1,126 +1,103 @@
 import torch
-import torch.optim as optim
 import torch.nn as nn
+import torch.optim as optim
 import pandas as pd
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+from model import BiLSTMModel
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score
-from model import BiLSTMClassifier
-from tqdm import tqdm
-import os
+from sklearn.model_selection import train_test_split
+from torchtext.data.utils import get_tokenizer
+from collections import Counter
+import torch.nn.functional as F
 
+# Définir le dataset personnalisé
+class LyricsDataset(Dataset):
+    def __init__(self, lyrics, labels, vocab, tokenizer):
+        self.lyrics = lyrics
+        self.labels = labels
+        self.vocab = vocab
+        self.tokenizer = tokenizer
+    
+    def __len__(self):
+        return len(self.lyrics)
+    
+    def __getitem__(self, idx):
+        lyrics = self.lyrics[idx]
+        label = self.labels[idx]
+        tokenized_lyrics = [self.vocab[token] for token in self.tokenizer(lyrics)]
+        return torch.tensor(tokenized_lyrics), torch.tensor(label)
 
 # Charger les données
 df = pd.read_csv("paroles_artistes.csv")  # Charger le fichier CSV téléchargé
 # Encoder les labels (Artiste : Poopy ou Bodo)
-le = LabelEncoder()
-df['Artiste'] = le.fit_transform(df['Artiste'])  # Poopy -> 0, Bodo -> 1
+df['label'] = LabelEncoder().fit_transform(df['label'])  # Convertir les labels en numérique (0 ou 1)
 
-# Encoder les labels (Artiste : Poopy ou Bodo)
-le = LabelEncoder()
-df['Artiste'] = le.fit_transform(df['Artiste'])  # Poopy -> 0, Bodo -> 1
+# Tokenisation et création du vocabulaire
+tokenizer = get_tokenizer("basic_english")
+counter = Counter()
+for lyrics in df['lyrics']:
+    counter.update(tokenizer(lyrics))
+vocab = {word: idx+2 for idx, (word, _) in enumerate(counter.items())}  # Ajouter un index pour chaque mot
+vocab['<pad>'] = 0  # Index pour padding
+vocab['<unk>'] = 1  # Index pour unknwon words
 
-# Encodage des paroles en indices dans un vocabulaire
-all_words = [word for text in df['Paroles'] for word in text.split()]
-vocab = {word: idx+1 for idx, (word, _) in enumerate(set(all_words))}  # Chaque mot a un indice unique
+# Séparer les données en train et test
+X_train, X_test, y_train, y_test = train_test_split(df['lyrics'], df['label'], test_size=0.2, random_state=42)
 
-# Fonction de padding des séquences
-MAX_LENGTH = 100  # Longueur maximale de chaque séquence
-
-def pad_sequence(text, vocab, max_length=MAX_LENGTH):
-    words = text.split()
-    indexed_words = [vocab.get(word, 0) for word in words]  # Encodage des mots
-    padded = indexed_words[:max_length]
-    return padded + [0] * (max_length - len(padded))
-
-df['Padded'] = df['Paroles'].apply(lambda x: pad_sequence(x, vocab))
-
-# Dataset et DataLoader
-class LyricsDataset(Dataset):
-    def __init__(self, dataframe):
-        self.data = dataframe
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        tokens = torch.tensor(self.data['Padded'].iloc[idx], dtype=torch.long)
-        label = torch.tensor(self.data['Artiste'].iloc[idx], dtype=torch.long)
-        return tokens, label
-
-# Split des données
-train_data, test_data = train_test_split(df, test_size=0.2, random_state=42)
-
-train_dataset = LyricsDataset(train_data)
-test_dataset = LyricsDataset(test_data)
-
+# Créer des DataLoaders
+train_dataset = LyricsDataset(X_train.values, y_train.values, vocab, tokenizer)
+test_dataset = LyricsDataset(X_test.values, y_test.values, vocab, tokenizer)
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=64)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-# Initialisation du modèle
-VOCAB_SIZE = len(vocab) + 1  # Ajouter 1 pour le padding
-EMBEDDING_DIM = 100
-HIDDEN_DIM = 256
-OUTPUT_DIM = 2  # Poopy ou Bodo
-N_LAYERS = 2
-DROPOUT = 0.5
+# Initialiser le modèle
+input_dim = len(vocab)
+embedding_dim = 100
+hidden_dim = 256
+output_dim = 2  # "poopy" ou "bodo"
+n_layers = 2
+dropout = 0.5
 
-model = BiLSTMClassifier(VOCAB_SIZE, EMBEDDING_DIM, HIDDEN_DIM, OUTPUT_DIM, N_LAYERS, DROPOUT)
+model = BiLSTMModel(input_dim, embedding_dim, hidden_dim, output_dim, n_layers, dropout)
 
-# Optimiseur et fonction de perte
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+# Définir la fonction de perte et l'optimiseur
 criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters())
 
-# Entraînement du modèle
-def train(model, iterator, optimizer, criterion):
+# Fonction pour entraîner le modèle
+def train_model(model, train_loader, criterion, optimizer, num_epochs=10):
     model.train()
-    epoch_loss = 0
-    epoch_acc = 0
-    
-    for batch in tqdm(iterator):
-        text, labels = batch
-        optimizer.zero_grad()
-        output = model(text)
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for inputs, labels in train_loader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
         
-        loss = criterion(output, labels)
-        acc = accuracy_score(labels.numpy(), torch.argmax(output, 1).numpy())
-        
-        loss.backward()
-        optimizer.step()
-        
-        epoch_loss += loss.item()
-        epoch_acc += acc
-    
-    return epoch_loss / len(iterator), epoch_acc / len(iterator)
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(train_loader)}')
 
-# Fonction d'évaluation
-def evaluate(model, iterator, criterion):
+# Fonction pour évaluer le modèle
+def evaluate_model(model, test_loader):
     model.eval()
-    epoch_loss = 0
-    epoch_acc = 0
-    
+    correct = 0
+    total = 0
     with torch.no_grad():
-        for batch in tqdm(iterator):
-            text, labels = batch
-            output = model(text)
-            
-            loss = criterion(output, labels)
-            acc = accuracy_score(labels.numpy(), torch.argmax(output, 1).numpy())
-            
-            epoch_loss += loss.item()
-            epoch_acc += acc
+        for inputs, labels in test_loader:
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
     
-    return epoch_loss / len(iterator), epoch_acc / len(iterator)
+    accuracy = correct / total
+    print(f'Accuracy on test data: {accuracy*100:.2f}%')
 
-# Entraînement et évaluation sur plusieurs époques
-NUM_EPOCHS = 5
-for epoch in range(NUM_EPOCHS):
-    train_loss, train_acc = train(model, train_loader, optimizer, criterion)
-    val_loss, val_acc = evaluate(model, test_loader, criterion)
-    
-    print(f'Epoch {epoch+1}/{NUM_EPOCHS}')
-    print(f'Training Loss: {train_loss:.3f}, Training Accuracy: {train_acc:.3f}')
-    print(f'Validation Loss: {val_loss:.3f}, Validation Accuracy: {val_acc:.3f}')
+# Entraîner le modèle
+train_model(model, train_loader, criterion, optimizer, num_epochs=10)
+
+# Évaluer le modèle
+evaluate_model(model, test_loader)
+
 
